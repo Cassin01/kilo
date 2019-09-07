@@ -9,12 +9,14 @@
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <sys/types.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 /*** defines ***/
@@ -54,6 +56,9 @@ struct editorConfig {
     int screencols;
     int numrows;
     erow *row;
+    char *filename;
+    char statusmsg[80];
+    time_t statusmsg_time;
     struct termios orig_termios;
 };
 
@@ -83,7 +88,7 @@ void enableRawMode() {
     // ICRNL: Ctrl-M and return -> 10 to 13
     // IXON: Ctrl-s, Ctrl-q
     //     Ctrl-s, Ctrl-q はフロー制御に使われる
-	  raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
 
     // OPOST: output processing
     raw.c_oflag &= ~(OPOST);
@@ -98,8 +103,8 @@ void enableRawMode() {
 
     // VMIN: minimum number of bytes of input needed before read() can return
     // VTIME: maximum amount of time to wait before read() can return (1/10 of a second)
-		raw.c_cc[VMIN] = 0;
-		raw.c_cc[VTIME] = 1;
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 1;
 
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) die("tcsetattr");
 }
@@ -143,8 +148,8 @@ int editorReadKey() {
             }
         } else if (seq[0] == '0') {
             switch (seq[1]) {
-                    case 'H': return HOME_KEY;
-                    case 'F': return END_KEY;
+                case 'H': return HOME_KEY;
+                case 'F': return END_KEY;
             }
         }
 
@@ -323,6 +328,9 @@ void editorAppendRow(char *s, size_t len) {
 
 /*** file i/o ***/
 void editorOpen(char *filename) {
+    free(E.filename);
+    E.filename = strdup(filename);
+
     FILE *fp = fopen(filename, "r");
     if (!fp) die("fopen");
 
@@ -331,8 +339,8 @@ void editorOpen(char *filename) {
     ssize_t linelen;
     while ((linelen = getline(&line, &linecap, fp)) != -1) {
         while (linelen > 0 && (
-            line[linelen - 1] == '\n' ||
-            line[linelen - 1] == '\r'))
+                    line[linelen - 1] == '\n' ||
+                    line[linelen - 1] == '\r'))
             linelen--;
         editorAppendRow(line, linelen);
     }
@@ -391,8 +399,8 @@ void editorDrawRows(struct abuf *ab) {
         if (filerow >= E.numrows) {
             if (E.numrows == 0 && y == E.screenrows / 3) {
                 char welcome[80];
-                int welcomelen = snprintf(welcome, sizeof(welcome), 
-                    "Kilo editor -- version %s", KILO_VERSION);
+                int welcomelen = snprintf(welcome, sizeof(welcome),
+                        "Kilo editor -- version %s", KILO_VERSION);
                 if (welcomelen > E.screencols) welcomelen = E.screencols;
 
 
@@ -419,6 +427,39 @@ void editorDrawRows(struct abuf *ab) {
     }
 }
 
+void editorDrawStatusBar(struct abuf *ab) {
+    // 白黒反転させる
+    abAppend(ab, "\x1b[7m", 4);
+    char status[80], rstatus[80];
+    int len = snprintf(status, sizeof(status), "%.20s - %d lines",
+            E.filename ? E.filename : "[No Name]", E.numrows);
+    int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d",
+            E.cy + 1, E.numrows);
+    if (len > E.screencols) len = E.screencols;
+    abAppend(ab, status, len);
+    while (len < E.screencols) {
+        if (E.screencols - len == rlen) {
+            abAppend(ab, rstatus, rlen);
+            break;
+        } else {
+            abAppend(ab, " ", 1);
+            len++;
+        }
+    }
+    // 修飾をクリア
+    abAppend(ab, "\x1b[m", 3);
+    abAppend(ab, "\r\n", 2);
+}
+
+void editorDrawMessageBar(struct abuf *ab) {
+    // ESC [K: カーソルの行の終わりまでを消去
+    abAppend(ab, "\x1b[K", 3);
+    int msglen = strlen(E.statusmsg);
+    if (msglen > E.screencols) msglen = E.screencols;
+    if (msglen && time(NULL) - E.statusmsg_time < 5)
+        abAppend(ab, E.statusmsg, msglen);
+}
+
 void editorRefreshScreen() {
     editorScroll();
 
@@ -430,11 +471,13 @@ void editorRefreshScreen() {
     abAppend(&ab, "\x1b[H", 3);
 
     editorDrawRows(&ab);
+    editorDrawStatusBar(&ab);
+    editorDrawMessageBar(&ab);
 
     char buf[32];
-    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", 
-        (E.cy - E.rowoff) + 1, 
-        (E.rx - E.coloff) + 1);
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH",
+            (E.cy - E.rowoff) + 1,
+            (E.rx - E.coloff) + 1);
     abAppend(&ab, buf, strlen(buf));
 
     abAppend(&ab, "\x1b[?25h", 6);
@@ -442,6 +485,14 @@ void editorRefreshScreen() {
     write(STDOUT_FILENO, ab.b, ab.len);
     abFree(&ab);
 
+}
+
+void editorSetStatusMessage(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(E.statusmsg, sizeof(E.statusmsg), fmt, ap);
+    va_end(ap);
+    E.statusmsg_time = time(NULL);
 }
 
 /*** init ***/
@@ -452,8 +503,12 @@ void initEditor() {
     E.coloff = 0;
     E.numrows = 0;
     E.row = NULL;
+    E.filename = NULL;
+    E.statusmsg[0] = '\0';
+    E.statusmsg_time = 0;
+
     if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
-    E.screenrows -= 1;
+    E.screenrows -= 2;
 }
 
 int main(int argc, char *argv[]) {
@@ -462,6 +517,8 @@ int main(int argc, char *argv[]) {
     if (argc >= 2) {
         editorOpen(argv[1]);
     }
+
+    editorSetStatusMessage("HELP: Ctrl-Q = quit");
 
     while (1) {
         editorRefreshScreen();
